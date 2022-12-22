@@ -3,6 +3,7 @@
 /*==========================================================*/
 #pragma once
 #include <assert.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -64,8 +65,12 @@ typedef struct allocator_i {
 	 * prev_size is the size of the memory block ptr is pointing at
 	 * new_size is the requested size of the block after the call
 	 */
-	void* (*alloc)(allocator_i* a, void* ptr, size_t prev_size, size_t new_size);
+	void* (*alloc)(allocator_i* a, void* ptr, size_t prev_size, size_t new_size, const char* file, uint32_t line);
 } allocator_i;
+
+#define tcmalloc(_a, _s) (_a)->alloc(_a, NULL, 0, _s, __FILE__, __LINE__)
+#define tcfree(_a, _p, _s) (_a)->alloc(_a, _p, _s, 0, __FILE__, __LINE__)
+#define tcrealloc(_a, _p, _prev, _new) (_a)->alloc(_a, _p, _prev, _new, __FILE__, __LINE__)
 
 
 /*==========================================================*/
@@ -101,7 +106,9 @@ inline void* __buff_growf(void* arr, int increment, int elemsize, allocator_i* a
 		a,
 		arr ? _buff_raw(arr) : 0,
 		(size_t)old_size * elemsize + (arr ? sizeof(uint32_t) * 2 : 0),
-		(size_t)size * elemsize + sizeof(uint32_t) * 2
+		(size_t)size * elemsize + sizeof(uint32_t) * 2,
+		file,
+		line
 	);
 	if (ptr) {
 		if (!arr) ptr[1] = 0;
@@ -589,6 +596,10 @@ static inline void rb_transplant(rbnode_t** root, rbnode_t* x, rbnode_t* y) {
 
 #define TEMP_CLOSE(a) temp_free((&a))
 
+// Smallest possible slab size
+#define SLAB_MIN_SIZE (((size_t)USHRT_MAX) + 1)
+#define CHUNK_SIZE (4096)
+
 
 typedef struct temp_s {
 	allocator_i;
@@ -619,9 +630,9 @@ typedef struct temp_node_s {
 
 
 void temp_init(temp_t* a, allocator_i* parent) {
-	a->instance = a;
+	a->ctx = a;
 	a->alloc = temp_realloc;
-	a->parent = parent ? parent : tc_memory->vm;
+	a->parent = parent;
 	temp_internal_t* temp = (temp_internal_t*)a->buffer;
 	temp->used = sizeof(temp_internal_t);
 	temp->cap = sizeof(a->buffer);
@@ -634,7 +645,7 @@ void* temp_realloc(temp_t* a, void* ptr, size_t old_size, size_t new_size, const
 	if (new_size > old_size) {
 		if (temp->used + new_size > temp->cap) {
 			size_t size = min(CHUNK_SIZE, next_power_of_2(new_size + sizeof(temp_node_t)));
-			temp_node_t* node = tc_malloc(a->parent, size);
+			temp_node_t* node = tcmalloc(a->parent, size);
 			node->size = size;
 			node->next = a->next;
 			a->next = node;
@@ -683,7 +694,7 @@ static inline size_t atomic_load(const atomic_t* object, bool acquire) {
 
 static inline void atomic_store(atomic_t* object, size_t desired, bool release) {
 	if (release) thread_fence_release();
-	object->_nonatomic = value;
+	object->_nonatomic = desired;
 }
 
 static inline bool compare_exchange_weak(atomic_t* object, size_t* expected, size_t desired) {
@@ -804,7 +815,7 @@ typedef struct cell_s {
 } cell_t;
 
 static inline lf_queue_t* lf_queue_init(uint32_t elements, allocator_i* a) {
-	lf_queue_t* queue = (lf_queue_t*)a->alloc(a, NULL, 0, sizeof(lf_queue_t) + elements * sizeof(cell_t));
+	lf_queue_t* queue = (lf_queue_t*)tcmalloc(a, sizeof(lf_queue_t) + elements * sizeof(cell_t));
 	queue->base = a;
 	queue->buffer = (cell_t*)(queue + 1);
 	queue->mask = elements - 1;
@@ -853,13 +864,12 @@ static inline bool lf_queue_get(lf_queue_t* queue, void** data) {
 }
 
 static inline void lf_queue_destroy(lf_queue_t* queue) {
-	queue->base->alloc(queue->base, queue, sizeof(lf_queue_t) + ((queue->mask + 1) * sizeof(cell_t)), 0);
+	tcfree(queue->base, queue, sizeof(lf_queue_t) + ((queue->mask + 1) * sizeof(cell_t)), 0);
 }
 
 /*==========================================================*/
 /*				LOCK-FREE REGION ALLOCATOR					*/
 /*==========================================================*/
-
 
 typedef struct region_s {
 	allocator_i base;
@@ -884,7 +894,7 @@ allocator_i* region_create(allocator_i* base) {
 	region_t* region = tc_malloc(base, sizeof(region_t));
 	region->parent = base;
 	region->slabs.next = 0;
-	region->base.instance = region;
+	region->base.ctx = region;
 	region->base.alloc = region_alloc;
 	return &region->base;
 }
@@ -906,14 +916,14 @@ void* region_aligned_alloc(region_t* region, size_t size, size_t align) {
 
 static
 void* region_alloc(allocator_i* a, void* ptr, size_t old_size, size_t new_size, const char* file, uint32_t line) {
-	region_t* region = a->instance;
+	region_t* region = a->ctx;
 	if (!ptr && new_size > 0) return region_aligned_alloc(region, new_size, 4);
 	else TC_ASSERT(old_size == 0, "[Memory]: Freeing from region allocator is not implemented");
 	return NULL;
 }
 
 void region_destroy(allocator_i* a) {
-	region_t* region = a->instance;
+	region_t* region = a->ctx;
 	for (;;) {
 		struct rslab* r = lf_lifo_pop(&region->slabs);
 		if (r) tc_free(region->parent, r, r->size);
@@ -932,4 +942,305 @@ static inline uintptr_t _align_ptr(uintptr_t* ptr, uintptr_t align) {
 	addr = (addr + (align - 1)) & -align;
 	TC_ASSERT(addr >= (uintptr_t)ptr);
 	return addr;
+}
+
+/*==========================================================*/
+/*						HASH FUNCTIONS						*/
+/*==========================================================*/
+
+// Code based on MurmurHash2, 64-bit versions, by Austin Appleby
+//
+// All code is released to the public domain. For business purposes, Murmurhash is
+// under the MIT license.
+
+static inline uint64_t hash64(const void* key, uint32_t len, uint64_t seed) {
+	const uint64_t m = 0xc6a4a7935bd1e995ULL;
+	const int r = 47;
+
+	uint64_t h = seed ^ (len * m);
+
+	const uint64_t* data = (const uint64_t*)key;
+	const uint64_t* end = data + (len / 8);
+
+	while (data != end) {
+		uint64_t k = *data++;
+
+		k *= m;
+		k ^= k >> r;
+		k *= m;
+
+		h ^= k;
+		h *= m;
+	}
+
+	const unsigned char* data2 = (const unsigned char*)data;
+
+	switch (len & 7) {
+	case 7:
+		h ^= (uint64_t)(data2[6]) << 48;
+	case 6:
+		h ^= (uint64_t)(data2[5]) << 40;
+	case 5:
+		h ^= (uint64_t)(data2[4]) << 32;
+	case 4:
+		h ^= (uint64_t)(data2[3]) << 24;
+	case 3:
+		h ^= (uint64_t)(data2[2]) << 16;
+	case 2:
+		h ^= (uint64_t)(data2[1]) << 8;
+	case 1:
+		h ^= (uint64_t)(data2[0]);
+		h *= m;
+	};
+
+	h ^= h >> r;
+	h *= m;
+	h ^= h >> r;
+
+	return h;
+}
+
+static inline uint64_t hash_str(const char* s) {
+	return s ? hash64(s, (uint32_t)strlen(s), 0) : 0;
+}
+
+static inline uint64_t hash_str_len(const char* s, uint32_t len) {
+	return s ? hash64(s, len, 0) : 0;
+}
+
+/** Definition of hashmap functions */
+
+// Large value integer hashmap (for pointers and such)
+typedef struct {
+	uint64_t* keys;
+	uint64_t* vals;
+	uint32_t cap;
+	allocator_i* a;
+} hash_t;
+
+#define MAX_CHAIN_LENGTH 8
+#define INITIAL_MAP_SIZE 4
+
+/** Private function definitions: */
+static inline int32_t hash_hash(hash_t* m, uint64_t key);
+static inline bool hash_rehash(hash_t* map);
+
+/* Definition of hashmap functions */
+
+/** Initialize a new hashmap with 64 bit keys and values */
+inline void hash_init(hash_t* map, allocator_i* a) {
+	map->cap = INITIAL_MAP_SIZE;
+	map->a = a;
+	size_t s = map->cap * sizeof(uint64_t);
+	map->keys = tcmalloc(a, s * 2);
+	memset(map->keys, 0, s * 2);
+	map->vals = (size_t)map->keys + s;
+}
+
+/** Put 64 bit value value in the hashmap at 64 bit key */
+inline bool hash_put(hash_t* map, uint64_t key, uint64_t value) {
+	assert(key != 0);
+	int32_t i = hash_hash(map, key);
+	while (i < 0) {
+		if (!hash_rehash(map)) return false;
+		i = hash_hash(map, key);
+	}
+	map->keys[i] = key;
+	map->vals[i] = value;
+	return true;
+}
+
+/** Returns value at key or returns 0 */
+inline uint64_t hash_get(hash_t* map, uint64_t key) {
+	assert(key != 0);
+	if (map->keys == NULL) return 0;
+	uint64_t curr = key & (map->cap - 1);
+	for (uint32_t i = 0; i < MAX_CHAIN_LENGTH; i++) {
+		if (map->keys[curr] == key) return map->vals[curr];
+		curr = (curr + 1) & (map->cap - 1);
+	}
+	return 0;
+}
+
+/** Remove value at key from the hashmap */
+inline bool hash_remove(hash_t* map, uint64_t key) {
+	assert(key != 0);
+	if (map->keys == NULL) return false;
+	uint64_t curr = key & (map->cap - 1);
+	for (uint32_t i = 0; i < MAX_CHAIN_LENGTH; i++) {
+		if (map->keys[curr] == key) {
+			map->keys[curr] = 0;
+			map->vals[curr] = 0;
+			return true;
+		}
+		curr = (curr + 1) & (map->cap - 1);
+	}
+	return false;
+}
+
+/** Free memory allocated by the hashmap */
+inline void hash_free(hash_t* map) {
+	tcfree(map->a, map->keys, (size_t)map->cap * 2 * sizeof(uint64_t), 0);
+}
+
+static inline int32_t hash_hash(hash_t* m, uint64_t key) {
+	uint32_t curr = key & (m->cap - 1);
+	for (uint32_t i = 0; i < MAX_CHAIN_LENGTH; i++) {
+		if (m->keys[curr] == 0 || m->keys[curr] == key) {
+			return curr;
+		}
+		curr = (curr + 1) & (m->cap - 1);
+	}
+	return -1;
+}
+
+static inline bool hash_rehash(hash_t* map) {
+	size_t size = map->cap;
+	size_t new_size = 2 * size;
+	uint64_t* temp_keys = tcmalloc(map->a, new_size * 2 * sizeof(uint64_t));
+	memset(temp_keys, 0, new_size * 2 * sizeof(uint64_t));
+	uint64_t* temp_vals = ((size_t)temp_keys) + new_size * sizeof(uint64_t);
+	uint64_t* curr_keys = map->keys; map->keys = temp_keys;
+	uint64_t* curr_vals = map->vals; map->vals = temp_vals;
+	map->cap = new_size;
+	for (size_t i = 0; i < size; i++) {
+		if (curr_keys[i] == 0) continue;
+		if (!hash_put(map, curr_keys[i], curr_vals[i])) return false;
+	}
+	tcfree(map->a, curr_keys, size * 2 * sizeof(uint64_t));
+	return true;
+}
+
+/*==========================================================*/
+/*							STRINGS							*/
+/*==========================================================*/
+
+typedef struct stringentry_s stringentry_t;
+
+typedef struct strings_s {
+	allocator_i* base;
+	stringentry_t* entries; /* buff */
+	uint32_t free_entry;
+	hash_t lookup;
+} strings_t;
+
+/** Private structs */
+
+typedef struct stringentry_s {
+	char* string;
+	uint64_t hash;
+	int16_t len;
+	int16_t ref;
+} stringentry_t;
+
+/** Create a new string pool */
+inline void str_init(strings_t* pool, allocator_i* a) {
+	pool->base = a;
+	hash_init(&pool->lookup, pool->base);
+}
+
+inline void str_free(strings_t* pool) {
+	uint32_t entries = buff_count(pool->entries);
+	for (uint32_t i = 0; i < entries; i++) {
+		stringentry_t entry = pool->entries[i];
+		if (entry.ref)
+			tcfree(pool->base, entry.string - sizeof(uint32_t), entry.len + 1 + sizeof(uint32_t));
+	}
+	buff_free(pool->entries, pool->base);
+	hash_free(&pool->lookup);
+}
+
+#define PAGEBITS 12
+#define PAGESIZE (1<<PAGEBITS)
+
+/**
+ * Looks up a string and returns the existing handle or returns a new handle and stores the string internally.
+ * Reference count gets increased.
+ */
+inline uint64_t str_intern(strings_t* pool, const char* str, uint32_t len) {
+	if (!len) return 0;
+	assert(len < PAGESIZE);
+	uint64_t hash = tc_hash_str_len(str, len);
+	uint32_t index = hash_get(&pool->lookup, hash);
+	if (index) {
+		stringentry_t* entry = &pool->entries[index - 1];
+		assert(entry->hash == hash,
+			"[String]: Corrupted hash in entry");
+		assert(entry->len == len && memcmp(entry->string, str, len) == 0, \
+			"[String]: Hash collision detected between %s and %s. You should change the string or hash function", entry->string, str);
+		// Increase reference count
+		entry->ref++;
+	}
+	else {
+		// String not found, put it it in the pool
+		size_t data_size = len + 1 + sizeof(uint32_t);
+		char* data = tc_malloc(pool->base, data_size);
+		stringentry_t new_entry = { .string = data + sizeof(uint32_t), .hash = hash, .len = len, .ref = 1 };
+		if (pool->free_entry) {
+			index = pool->free_entry;
+			pool->free_entry = *(uint32_t*)&pool->entries[index - 1];
+			pool->entries[index - 1] = new_entry;
+		}
+		else {
+			// Add 1 so we can check for zero index
+			index = buff_count(pool->entries) + 1;
+			buff_push(pool->entries, pool->base, new_entry);
+		}
+		hash_put(&pool->lookup, hash, index);
+		// Copy string to storage
+		*(uint32_t*)data = len;
+		data += sizeof(uint32_t);
+		memcpy(data, str, len);
+		data[len] = '\0';
+	}
+	return hash;
+}
+
+/**
+ * Increase reference to a string, make sure to release the reference at cleanup
+ */
+inline uint64_t str_retain(strings_t* pool, uint64_t sid) {
+	if (sid) {
+		uint32_t index = hash_get(&pool->lookup, sid);
+		assert(index);
+		stringentry_t* entry = &pool->entries[index - 1];
+		++entry->ref;
+	}
+	return sid;
+}
+
+/**
+ * Drops reference to a string. When no references exist the string gets garbage collected.
+ */
+inline void str_release(strings_t* pool, uint64_t sid) {
+	if (sid) {
+		uint32_t index = hash_get(&pool->lookup, sid);
+		assert(index);
+		stringentry_t* entry = &pool->entries[index - 1];
+		if (--entry->ref == 0) {
+			// Free entry and string
+			hash_remove(&pool->lookup, entry->hash);
+			tcfree(pool->base, entry->string - sizeof(uint32_t), entry->len + 1 + sizeof(uint32_t));
+			memset(entry, 0, sizeof(stringentry_t));
+			// Add entry to free entries list
+			*(uint32_t*)entry = pool->free_entry;
+			pool->free_entry = index;
+		}
+	}
+}
+
+/**
+ * Returns a pointer to internally stored string and optionally its length .
+ * (Do not use the pointer after interning another string)
+ */
+inline const char* str_get(strings_t* pool, uint64_t sid, uint32_t* len) {
+	if (sid) {
+		uint32_t index = hash_get(&pool->lookup, sid);
+		if (index) {
+			stringentry_t entry = pool->entries[index - 1];
+			if (len) *len = entry.len;
+			return entry.string;
+		}
+	}
+	return NULL;
 }
